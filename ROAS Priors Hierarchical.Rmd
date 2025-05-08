@@ -1,0 +1,368 @@
+---
+title: "ROAS Priors Hierarchical"
+output: html_document
+date: "2025-03-17"
+---
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(tidyverse)
+library(rstan)
+library(cowplot)
+```
+
+```{r}
+set.seed(123)
+
+# Simulate the data
+weeks <- 104
+geos <- 100
+t <- 1:weeks
+
+# White noise
+w <- matrix(rnorm(weeks*geos, 0, 1), nrow = weeks, ncol = geos)
+
+# Control variable
+z <- cos(2*pi*(t-12)/52) + w
+
+# Simulate the media variable based on the control variable
+
+# A random number as the base of each geo
+u <- rnorm(geos, 0, 1)
+
+# A random positive correlation for each geo
+p <- runif(geos, 0, 1)
+
+v <- matrix(rnorm(weeks*geos, 0, 1), nrow = weeks, ncol = geos)
+
+x <- u + sweep(z, 2, p, "*") + sweep(v, 2, (1-p**2)**0.5, "*")
+
+# take only the positive part of x
+x_nonzero <- pmax(x, 0)
+```
+
+```{r}
+# Graph the control variable for a single geo
+plot(t, z[,1], xlab="weeks", ylab = "control variable", type = "l", col="green")
+```
+
+```{r}
+# Graph the spend variable for a single geo
+plot(t, x_nonzero[,1], xlab="weeks", ylab = "raw spend", type = "l", col="orange")
+```
+
+```{r}
+# Define saturation and adstock parameters and functions; x is a matrix in each function
+kappa <- 1
+slope <- 1
+alpha <- 0.5
+L <- 3
+
+# Hill function
+hill <- function(x, kappa, slope) {
+  return(1/(1+(x/kappa)**-slope))
+}
+
+# Adstock function
+adstock <- function(x, alpha, L) {
+  # matrix to hold the results
+  x_decayed_mat <- matrix(numeric(0), nrow = nrow(x), ncol = 0)
+  # loop through each geo
+  for (i in 1:ncol(x)) {
+    x_decayed <- c(x[1,i], rep(0, nrow(x) - 1))
+    for (j in 2:length(x_decayed)) {
+      # Cut the lookback window down when j is within L of the first datapoint
+      if (j <= L) {
+        lookback_window <- 0:(j-1)
+        alpha_vector <- alpha**lookback_window
+        x_decayed[j] <- sum(alpha_vector*x[j:1,i])/sum(alpha_vector)
+      } else {
+        # Use lookback window of size L + 1 for the rest of the data
+        lookback_window <- 0:L
+        alpha_vector <- alpha**lookback_window
+        x_decayed[j] <- sum(alpha_vector*x[j:(j-L), i])/sum(alpha_vector)
+      }
+    }
+    x_decayed_mat <- cbind(x_decayed_mat, x_decayed)
+    }
+  return(x_decayed_mat)
+}
+```
+
+```{r}
+# Perform the saturation and adstock transformations
+x_saturated <- hill(x_nonzero, kappa, slope)
+x_saturated_adstocked <- adstock(x_saturated, alpha, L)
+```
+
+```{r}
+# Graph the media variable saturated for a single geo
+plot(t, x_saturated[,1], xlab="weeks", ylab="saturated spend", type="l", col="green")
+```
+
+```{r}
+# Graph the media variable saturated and adstocked
+plot(t, x_saturated_adstocked[,1], xlab="weeks", ylab="saturated and adstocked spend", type="l", col="orange")
+```
+
+```{r}
+# Parameters for simulating the sales data
+
+# Choose parameters to simulate the data
+tau.mean <- 10
+k <- 1
+beta.mean <- 3
+eta <- 1
+gamma.mean <- 1
+xi <- 1
+sigma <- 5
+
+tau <- rnorm(geos, tau.mean, k)
+beta <- rnorm(geos, beta.mean, eta)
+gamma <- rnorm(geos, gamma.mean, xi)
+epsilon <- matrix(rnorm(weeks*geos, 0, sigma), nrow = weeks, ncol = geos)
+```
+
+```{r}
+# generate the sales data
+y = tau + sweep(x_saturated_adstocked, 2, beta, "*") + sweep(z, 2, gamma, "*") + epsilon
+```
+
+```{r}
+# Plot the sales data for one geo
+plot(t, y[,1], type="l", col="blue")
+```
+
+```{r}
+# Plot the raw control variable, raw spend, and sales together for a single geo.
+plot(t, x_nonzero[,1], xlab = "weeks", ylab = "variables", type="l", col="orange", ylim=c(-3, 25))
+lines(t, z[,1], type="l", col="green")
+lines(t, y[,1], type="l", col="blue")
+legend("topright", legend = c("Sales", "Spend Variable", "Control Variable"), col = c("blue", "orange", "green"), lty = 1)
+```
+
+```{r}
+# Ground truth ROAS calculation 
+x_adstocked_saturated <- hill(adstock(x_nonzero, alpha, 3), kappa, slope)
+
+iROAS_avg <- sum(sweep(x_adstocked_saturated, 2, beta, "*"))/sum(x_nonzero)
+iROAS_avg
+```
+
+```{r}
+### Do 100 data simulations and get the log mean and standard deviations of the iROAS
+
+iROAS_vec <- rep(0, 100)
+
+for (i in 1:100) {
+
+  w.1 <- matrix(rnorm(weeks*geos, 0, 1), nrow = weeks, ncol = geos)
+  z.1 <- cos(2*pi*(t-12)/52) + w.1
+  u.1 <- rnorm(geos, 0, 1)
+  p.1 <- runif(geos, 0, 1)
+  v.1 <- matrix(rnorm(weeks*geos, 0, 1), nrow = weeks, ncol = geos)
+  x.1 <- u.1 + sweep(z.1, 2, p.1, "*") + sweep(v.1, 2, (1-p.1**2)**0.5, "*")
+  x_nonzero.1 <- pmax(x.1, 0)
+  
+  # In the event that all spend is 0; skip the below steps
+  if (max(x_nonzero.1) == 0) {
+    next
+  }
+  
+  x_adstocked_saturated.1 <- hill(adstock(x_nonzero.1, alpha, 3), kappa, slope)
+  beta.1 <- rnorm(geos, beta.mean, eta)
+  
+  # Calculate the average ROAS values across geos
+  iROAS_vec[i] <- sum(sweep(x_adstocked_saturated.1, 2, beta.1, "*"))/sum(x_nonzero.1)
+
+}
+```
+
+```{r}
+# Plot the ROAS values
+iROAS_df <- data.frame(iROAS_vec) %>% filter(iROAS_vec != 0)
+meanlog_hat <- mean(log(iROAS_df$iROAS_vec))
+sdlog_hat <- sd(log(iROAS_df$iROAS_vec))
+
+iROAS_df %>% 
+  ggplot(aes(iROAS_vec)) +
+  geom_histogram(bins=50, fill="blue") +
+  stat_function(fun = dlnorm, args = list(meanlog = meanlog_hat, sdlog = sdlog_hat), 
+                color = "red", size = 1.2) +
+  xlab("ROAS") +
+  ylab("count")
+```
+
+```{r}
+# Create stan data list
+stan_data <- list(
+  N = weeks,
+  G = geos,
+  X = x_nonzero,
+  C = z,
+  Y = y,
+  L = L
+)
+
+# Save/load the data
+saveRDS(stan_data, file = "file/path.rds")
+#stan_data <- readRDS("file/path.rds")
+```
+
+```{r}
+options(mc.cores = parallel::detectCores())
+stan_model <- stan_model("roas_priors_hierarchical.stan")
+stan_fit <- sampling(stan_model, data=stan_data1, iter=3000, chains = 4, control = list(adapt_delta = 0.99, max_treedepth = 12))
+```
+
+```{r}
+# Save/load the model
+saveRDS(stan_fit, file = "file/path.rds")
+#stan_fit <- readRDS("file/path.rds")
+```
+
+```{r}
+traceplot(stan_fit, pars = c("roas", "alpha", "kappa", "slope", "intercept_pop", "gamma_pop", "sigma"))
+```
+
+```{r}
+print(stan_fit, pars=c("roas", "alpha", "kappa", "slope", "intercept_pop", "gamma_pop", "sigma"))
+```
+
+```{r}
+samples_extracted <- rstan::extract(stan_fit)
+```
+
+```{r}
+samples_df <- data.frame(roas = samples_extracted$roas,
+                         kappa = samples_extracted$kappa,
+                         slope = samples_extracted$slope,
+                         alpha = samples_extracted$alpha,
+                         intercept = samples_extracted$intercept_pop,
+                         gamma = samples_extracted$gamma_pop,
+                         sigma = samples_extracted$sigma)
+```
+
+```{r}
+# Plot ROAS posterior
+p1 <- samples_df %>% 
+  ggplot(aes(x=roas)) +
+  geom_density(fill="lightblue") +
+  geom_vline(xintercept = iROAS_avg, color = "red") +
+  xlab("ROAS")
+```
+
+```{r}
+# Plot kappa posterior
+p2 <- samples_df %>% 
+  ggplot(aes(x = kappa)) +
+  geom_density(fill="lightblue") +
+  geom_vline(xintercept = kappa, color = "red") +
+  xlab("kappa")
+```
+
+```{r}
+# Plot slope posterior
+p3 <- samples_df %>% 
+  ggplot(aes(x = slope)) +
+  geom_density(fill="lightblue") +
+  geom_vline(xintercept = slope, color = "red") +
+  xlab("slope")
+```
+
+```{r}
+# Plot alpha posterior
+p4 <- samples_df %>% 
+  ggplot(aes(x=alpha)) +
+  geom_density(fill="lightblue") +
+  geom_vline(xintercept = alpha, color = "red") +
+  xlab("alpha")
+```
+
+```{r}
+plot_grid(p1, p2, p3, p4, 
+          ncol = 2, align = "hv")
+```
+
+```{r}
+# Plot intercept posterior
+p5 <- samples_df %>% 
+  ggplot(aes(x = intercept)) +
+  geom_density(fill="lightblue") +
+  geom_vline(xintercept = tau.mean, color = "red") +
+  xlab("intercept")
+```
+
+```{r}
+# Plot population gamma posterior
+p6 <- samples_df %>% 
+  ggplot(aes(gamma)) +
+  geom_density(fill="lightblue") +
+  geom_vline(xintercept = gamma.mean, color = "red") +
+  xlab("gamma")
+```
+
+```{r}
+# Plot sigma posterior
+p7 <- samples_df %>%
+  ggplot(aes(x = sigma)) +
+  geom_density(fill="lightblue") +
+  geom_vline(xintercept = sigma, color = "red") +
+  xlab("sigma")
+```
+
+```{r}
+plot_grid(p5, p6, p7, 
+          ncol = 2, align = "hv")
+```
+
+```{r}
+# Fit the geo-model without ROAS priors calibration
+stan_model.1 <- stan_model("hierarchical_base.stan")
+stan_fit.1 <- sampling(stan_model.1, data=stan_data, iter=3000, chains = 4, control = list(adapt_delta = 0.99, max_treedepth = 12))
+
+saveRDS(stan_fit.1, file = "file/path.rds")
+#stan_fit.1 <- readRDS("file/path.rds")
+```
+
+```{r}
+samples_extracted.1 <- rstan::extract(stan_fit.1)
+```
+
+```{r}
+# population level ROAS calculation for non-calibrated hierarchical model (weighted sum of geo-level ROAS values)
+
+# first extract the posteriors
+beta_geos_est <- samples_extracted.1$beta 
+alpha_est <- samples_extracted.1$alpha
+kappa_est <- samples_extracted.1$kappa
+slope_est <- samples_extracted.1$slope
+
+weights_geos <- colSums(x_nonzero) / sum(x_nonzero) # Total spend of each geo across the entire modeling window divided by the total spend across all geos.
+roas_pop_est <- numeric(6000)
+  
+for (i in 1:6000) {
+  x_adstocked_saturated_est <- hill(adstock(x_nonzero, alpha_est[i], 3), kappa_est[i], slope_est[i])
+  roas_geos_est = colSums(beta_geos_est[i] * x_adstocked_saturated_est) / colSums(x_nonzero)
+  roas_pop_est[i] = sum(weights_geos*roas_geos_est)
+}
+
+# Save/load the data
+saveRDS(roas_pop_est, file = "file/path.rds")
+#roas_pop_est <- readRDS("files/path.rds")
+```
+
+```{r}
+# Plot the comparison of the geo model with and with out ROAS priors
+df <- data.frame(category=factor(rep(c("w/o calibration", "full window ROAS prior"), each=6000)),
+                 ROAS=c(roas_pop_est, samples_df$roas)
+                 )
+
+ggplot(df, aes(x=ROAS, color=category, fill=category)) +
+  geom_density(alpha=0.3) +
+  geom_vline(xintercept = iROAS_avg, color = "black") +
+  scale_x_continuous(breaks=seq(0, 2.5, 0.2))
+  labs(y = "Density")
+
+```
